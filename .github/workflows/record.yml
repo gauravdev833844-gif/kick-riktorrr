@@ -1,0 +1,160 @@
+name: Kick Stream Recorder
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Recording duration per shift in hours (default 4.5)'
+        required: false
+        default: '4.5'
+        type: string
+      shifts_left:
+        description: 'Continuation shifts after this one (default 2 = 3 shifts total / ~13h)'
+        required: false
+        default: '2'
+        type: string
+      always_continue:
+        description: 'true = automatically trigger next shift when current shift ends'
+        required: false
+        default: 'true'
+        type: string
+      channel:
+        description: 'Kick channel slug (leave empty to use default repo channel)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies (ffmpeg, jq, curl)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq curl
+
+      - name: Install Python Dependencies (yt-dlp, curl_cffi)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U "yt-dlp[default,curl-cffi]" curl_cffi
+
+      - name: Setup Kick Cookies
+        env:
+          KICK_COOKIES_SECRET: ${{ secrets.KICK_COOKIES }}
+        run: |
+          if [ -n "$KICK_COOKIES_SECRET" ]; then
+            echo "Using KICK_COOKIES secret from repository settings."
+            printf "%s\n" "$KICK_COOKIES_SECRET" > cookies.txt
+          elif [ -f "cookies.txt" ]; then
+            echo "Using repository cookies.txt file."
+          else
+            echo "WARNING: No cookies.txt or KICK_COOKIES secret found."
+          fi
+          if [ -f "cookies.txt" ]; then
+            echo "Cookies file size: $(wc -c < cookies.txt) bytes"
+          fi
+
+      - name: Run Kick Recorder
+        id: run_recorder
+        env:
+          CHANNEL_HANDLE: ${{ github.event.inputs.channel || vars.CHANNEL_HANDLE || 'riktorrr' }}
+          HOURS: ${{ github.event.inputs.hours || '4.5' }}
+          OUT_DIR: './streams'
+          COOKIES_FILE: './cookies.txt'
+        run: |
+          echo "Starting Kick recorder for channel: $CHANNEL_HANDLE (Duration: ${HOURS}h)"
+          python -u recorder.py
+
+      - name: Upload Recorded Streams to Gofile.io
+        if: always()
+        run: |
+          mkdir -p ./streams
+          echo "### 🎬 Kick Recording Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size | Gofile Download Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+
+          FOUND_FILES=0
+          for f in ./streams/*.ts; do
+            [ -e "$f" ] || continue
+            FOUND_FILES=1
+            FNAME=$(basename "$f")
+            FSIZE=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+            FSIZE_MB=$(( FSIZE / 1048576 ))
+
+            echo "Uploading $FNAME (${FSIZE_MB} MB) to Gofile..."
+            RESP=$(curl -s --connect-timeout 20 --max-time 900 -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
+            STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+
+            if [ "$STATUS" != "ok" ]; then
+              SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
+              if [ -n "$SERVER" ]; then
+                echo "Retrying via server ${SERVER}.gofile.io..."
+                RESP=$(curl -s --connect-timeout 20 --max-time 900 -X POST "https://${SERVER}.gofile.io/contents/uploadfile" -F "file=@$f" || true)
+                STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+              fi
+            fi
+
+            DOWNLOAD_LINK=""
+            if [ "$STATUS" == "ok" ]; then
+              DOWNLOAD_LINK=$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
+              echo "Gofile Upload Success: $DOWNLOAD_LINK"
+              echo "| $FNAME | ${FSIZE_MB} MB | [Download from Gofile]($DOWNLOAD_LINK) |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "Gofile upload failed for $FNAME"
+              echo "| $FNAME | ${FSIZE_MB} MB | ❌ Upload Failed (Available in Artifacts below) |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          if [ "$FOUND_FILES" -eq 0 ]; then
+            echo "| *(No live stream detected during this shift)* | 0 MB | Offline |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Stream Artifacts Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.channel || vars.CHANNEL_HANDLE || 'kick_stream' }}_shift_recordings
+          path: |
+            ./streams/*.ts
+            ./streams/*.log
+            ./streams/*.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Dispatch Next Continuation Shift
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '2' }}
+          ALWAYS_CONTINUE: ${{ github.event.inputs.always_continue || 'true' }}
+          HOURS: ${{ github.event.inputs.hours || '4.5' }}
+          CHANNEL: ${{ github.event.inputs.channel || vars.CHANNEL_HANDLE || '' }}
+        run: |
+          REMAINING=$(( SHIFTS_LEFT - 1 ))
+          if [ "$REMAINING" -ge 0 ] && [ "$ALWAYS_CONTINUE" == "true" ]; then
+            echo "Chaining next shift (${REMAINING} shifts left)..."
+            gh workflow run record.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$GITHUB_REF_NAME" \
+              -f hours="$HOURS" \
+              -f shifts_left="$REMAINING" \
+              -f always_continue="true" \
+              -f channel="$CHANNEL"
+            echo "Next shift dispatched successfully!"
+          else
+            echo "No more shifts remaining or continuation disabled."
+          fi
